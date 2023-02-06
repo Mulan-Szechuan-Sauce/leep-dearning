@@ -1,19 +1,10 @@
 use std::{thread::sleep, time::Duration};
-use rand::prelude::SliceRandom;
+use rand::prelude::{SliceRandom, ThreadRng};
 
 #[derive(Copy, Clone, PartialEq)]
 enum Tile {
     Empty,
     Wall,
-}
-
-#[derive(Copy, Clone, PartialEq)]
-enum Direction {
-    Noop,
-    Up,
-    Down,
-    Left,
-    Right,
 }
 
 fn clear_screen() {
@@ -24,10 +15,12 @@ struct Board {
     tiles: Vec<Vec<Tile>>,
     ghosts: Vec<(usize, usize)>,
     pacman: (usize, usize),
+    rng: ThreadRng,
 }
 
 trait PacmanAi {
-    fn select_move(&mut self, surroundings: [Tile; 8]) -> Direction;
+    /// Should only move at most once! Otherwise it is a BUUUUUUG
+    fn tick_pacman(&mut self, board: &mut Board);
 }
 
 impl Board {
@@ -36,6 +29,7 @@ impl Board {
             tiles: vec![vec![Tile::Empty; width]; height],
             ghosts: vec![],
             pacman: (5, 5),
+            rng: rand::thread_rng(),
         }
     }
 
@@ -78,40 +72,43 @@ impl Board {
     }
 
     fn tick_ghosts(&mut self) {
-        let mut rng = rand::thread_rng();
         for i in 0..self.ghosts.len() {
             let (x, y) = self.ghosts[i];
             let available_moves = [(x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y)]
                 .into_iter()
                 .filter(|(x, y)| matches!(self.tiles[*y][*x], Tile::Empty) && !self.has_ghost_at(*x, *y))
                 .collect::<Vec<_>>();
-            if let Some((xp, yp)) = available_moves.choose(&mut rng) {
+            if let Some((xp, yp)) = available_moves.choose(&mut self.rng) {
                 self.ghosts[i] = (*xp, *yp);
             }
         }
     }
 
     fn is_game_over(&self) -> bool {
-        self.ghosts.contains(&self.pacman)
+        let (x, y) = self.pacman;
+        self.tiles[y][x] == Tile::Wall || self.ghosts.contains(&self.pacman)
     }
 }
 
-struct QLearningPacman {
+struct PaQman {
 }
 
-impl QLearningPacman {
+impl PaQman {
     fn new() -> Self {
-        QLearningPacman {}
+        PaQman {}
     }
 }
 
-impl PacmanAi for QLearningPacman {
-    fn select_move(&mut self, surroundings: [Tile; 8]) -> Direction {
-        todo!()
+impl PacmanAi for PaQman {
+    fn tick_pacman(&mut self, board: &mut Board) {
+        let (x, y) = board.pacman;
+        let next = *[(x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y)].choose(&mut board.rng).unwrap();
+        board.pacman = next;
     }
 }
 
 fn main() {
+    let mut ai = PaQman::new();
     let mut board = Board::empty_with_edge_walls(10, 10);
     for x in 1..5 {
         board.ghosts.push((x, 1));
@@ -121,6 +118,11 @@ fn main() {
     loop {
         board.render();
         sleep(Duration::from_millis(100));
+        ai.tick_pacman(&mut board);
+        if board.is_game_over() {
+            println!("Game over... LOSER");
+            break;
+        }
         board.tick_ghosts();
         if board.is_game_over() {
             println!("Game over... LOSER");
