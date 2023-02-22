@@ -1,8 +1,8 @@
 use rand::{
-    prelude::{SliceRandom, ThreadRng},
-    Rng,
+    prelude::SliceRandom,
+    Rng, SeedableRng, rngs::SmallRng, distributions::Uniform,
 };
-use std::{collections::HashMap, thread::sleep, time::Duration};
+use std::{collections::HashMap, thread::sleep, time::Duration, io::{stdout, Write}};
 
 #[derive(Copy, Clone, PartialEq)]
 enum Background {
@@ -18,7 +18,7 @@ struct Board {
     tiles: Vec<Vec<Background>>,
     ghosts: Vec<(usize, usize)>,
     pacman: (usize, usize),
-    rng: ThreadRng,
+    rng: SmallRng,
 }
 
 trait PacmanAi {
@@ -32,7 +32,7 @@ impl Board {
             tiles: vec![vec![Background::Empty; width]; height],
             ghosts: vec![],
             pacman: (5, 5),
-            rng: rand::thread_rng(),
+            rng: SmallRng::from_entropy(),
         }
     }
 
@@ -80,14 +80,14 @@ impl Board {
     fn tick_ghosts(&mut self) {
         for i in 0..self.ghosts.len() {
             let (x, y) = self.ghosts[i];
-            let available_moves = [(x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y)]
-                .into_iter()
-                .filter(|(x, y)| {
-                    matches!(self.tiles[*y][*x], Background::Empty) && !self.has_ghost_at(*x, *y)
-                })
-                .collect::<Vec<_>>();
-            if let Some((xp, yp)) = available_moves.choose(&mut self.rng) {
-                self.ghosts[i] = (*xp, *yp);
+            let moves = [(x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y)];
+            let order = DIR_PERMUTATIONS.choose(&mut self.rng).unwrap();
+            for q in order.iter() {
+                let (xi, yi) = moves[*q];
+                if matches!(self.tiles[yi][xi], Background::Empty) && !self.has_ghost_at(xi, yi) {
+                    self.ghosts[i] = (xi, yi);
+                    break;
+                }
             }
         }
     }
@@ -96,6 +96,35 @@ impl Board {
         let (x, y) = self.pacman;
         self.tiles[y][x] == Background::Wall || self.ghosts.contains(&self.pacman)
     }
+}
+
+const DIR_PERMUTATIONS: [[usize; 4]; 24] = perms();
+
+// Non-recursive heaps algorithm
+const fn perms() -> [[usize; 4]; 24] {
+    let mut generated: [[usize; 4]; 24] = [[0; 4]; 24];
+    let mut to_permute = [0, 1, 2, 3];
+    // "push" initial combo
+    generated[0] = to_permute;
+    let mut gen_idx = 1;
+    let mut c = [0; 4];
+    let mut i = 0;
+    while i < to_permute.len() {
+        if c[i] < i {
+            let idx1 = if i % 2 == 0 { 0 } else { c[i] };
+            let tmp = to_permute[idx1];
+            to_permute[idx1] = to_permute[i];
+            to_permute[i] = tmp;
+            generated[gen_idx] = to_permute;
+            gen_idx += 1;
+            c[i] = c[i] + 1;
+            i = 0;
+        } else {
+            c[i] = 0;
+            i += 1;
+        }
+    }
+    generated
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -109,7 +138,7 @@ enum Action {
 
 impl Action {
     fn random() -> Action {
-        let mut rng = rand::thread_rng();
+        let mut rng = SmallRng::from_entropy();
         *[
             Action::Idle,
             Action::Up,
@@ -124,7 +153,7 @@ impl Action {
 
 type StateActions = [(Action, f64); 5];
 
-#[derive(Hash, PartialEq, Eq, Clone)]
+#[derive(Hash, PartialEq, Eq, Clone, Copy)]
 enum Tile {
     Empty,
     Ghost,
@@ -133,7 +162,8 @@ enum Tile {
 
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct QState {
-    surroundings: [Tile; 8],
+    // 5*5 - 1 view surrounding pacman
+    surroundings: [Tile; 24],
 }
 
 struct PaQman {
@@ -192,7 +222,7 @@ impl PaQman {
 
     /// Use discount rate to decide between rng and using the qable
     fn pick_action(&self, q_state: &QState) -> Action {
-        if rand::thread_rng().gen_range(0.0..1.0) < self.discount_rate {
+        if SmallRng::from_entropy().gen_range(0.0..1.0) < self.discount_rate {
             Action::random()
         } else {
             self.get_best_action(q_state).0
@@ -213,9 +243,6 @@ impl PaQman {
         if board.ghosts.contains(&coord) {
             Tile::Ghost
         } else {
-            if coord.1 >= board.tiles.len() || coord.0 >= board.tiles[0].len() {
-                return Tile::Empty;
-            }
             match board.tiles[coord.1][coord.0] {
                 Background::Empty => Tile::Empty,
                 Background::Wall => Tile::Wall,
@@ -224,18 +251,28 @@ impl PaQman {
     }
 
     fn make_q_state(board: &Board) -> QState {
-        let (x, y) = board.pacman;
+        let (xp, yp) = board.pacman;
+        let x = xp as i64;
+        let y = yp as i64;
         // Gnarly but gets the job done
-        let surroundings = [
-            (x.wrapping_sub(1), y.wrapping_sub(1)),
-            (x.wrapping_sub(1), y),
-            (x.wrapping_sub(1), y+1),
-            (x+1, y.wrapping_sub(1)),
-            (x+1, y),
-            (x+1, y+1),
-            (x, y+1),
-            (x, y.wrapping_sub(1)),
-        ].map(|coord| PaQman::tile_at_coord(board, coord));
+        let mut surroundings = [Tile::Empty; 24];
+        let mut i = 0;
+        let height = board.tiles.len() as i64;
+        let width = board.tiles[0].len() as i64;
+        for yi in y - 2..=y + 2 {
+            for xi in x - 2..=x + 2 {
+                if xi == x && yi == y {
+                    continue;
+                }
+                if xi >= 0 && yi >= 0 && xi < width && yi < height {
+                    surroundings[i] = PaQman::tile_at_coord(board, (xi as usize, yi as usize));
+                }
+                i += 1;
+            }
+        }
+        // TODO: Try to figure out how to convert gx & gy into surroundings indices
+        for (gx, gy) in board.ghosts.iter() {
+        }
         QState { surroundings }
     }
 }
@@ -247,32 +284,21 @@ impl PacmanAi for PaQman {
         let (x, y) = board.pacman;
         let new_coords = match action {
             Action::Idle => (x, y),
-            Action::Up => (x, y-1),
-            Action::Down => (x, y+1),
-            Action::Left => (x-1, y),
-            Action::Right => (x+1, y),
+            Action::Up => (x, y - 1),
+            Action::Down => (x, y + 1),
+            Action::Left => (x - 1, y),
+            Action::Right => (x + 1, y),
         };
         board.pacman = new_coords;
-        let reward = if board.is_game_over() {
-            -1.0
-        } else {
-            0.0
-        };
+        let reward = if board.is_game_over() { -1.0 } else { 0.0 };
         self.update_q_table(reward, &current_state, &PaQman::make_q_state(board), action);
-        // TODO: Use the proper rate for this
-        self.discount_rate *= 0.999995;
-
-        // fn do_tick(&mut self, q_state: &QState) {
-        //     let action = self.pick_action(q_state);
-        //     // let outcome = board.make_move(action)
-        //     self.update_q_table(todo!(), todo!(), todo!(), todo!())
-        // }
     }
 }
 
 fn main() {
     let mut ai = PaQman::new();
-    for iter in 0..100_000 {
+    let iter_count = 1_000_000;
+    for iter in 0..iter_count {
         let mut board = Board::empty_with_edge_walls(10, 10);
         for x in 1..5 {
             board.ghosts.push((x, 1));
@@ -287,8 +313,12 @@ fn main() {
             board.tick_ghosts();
         }
         if iter % 1000 == 0 {
-            println!("Ran iteration {iter}, {}", ai.discount_rate);
+            print!("Ran iteration {iter}, {}\r", ai.discount_rate);
+            stdout().flush().expect("I couldn't flush the toilet :(");
         }
+        let min_epsilon = 0.05f64;
+        let r = -min_epsilon.ln() / iter_count as f64;
+        ai.discount_rate = (-r * iter as f64).exp();
     }
     ai.discount_rate = 0.0;
 
