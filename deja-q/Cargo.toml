@@ -8,3 +8,6 @@ debug = true
 
 [dependencies]
 rand = { version = "0.8", features = ["small_rng"] }
+clap = { version = "4.1", features = ["derive"] }
+serde = "1.0"
+postcard = { version = "1.0", features = ["alloc"] }

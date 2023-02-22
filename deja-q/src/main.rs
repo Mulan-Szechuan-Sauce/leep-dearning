@@ -1,8 +1,42 @@
-use rand::{
-    prelude::SliceRandom,
-    Rng, SeedableRng, rngs::SmallRng, distributions::Uniform,
+use clap::{Parser, arg, Subcommand};
+use postcard::{to_allocvec, from_bytes};
+use rand::{prelude::SliceRandom, rngs::SmallRng, Rng, SeedableRng};
+use serde::{Serialize, Deserialize};
+use std::{
+    collections::HashMap,
+    io::{stdout, Write, Read},
+    thread::sleep,
+    time::Duration, fs::{File, self},
 };
-use std::{collections::HashMap, thread::sleep, time::Duration, io::{stdout, Write}};
+
+const DEFAULT_QUALITY: f64 = 0.0;
+
+// Use non-recursive heaps algorithm to generate all permutations of directions to try
+const DIR_PERMUTATIONS: [[usize; 4]; 24] = {
+    let mut generated: [[usize; 4]; 24] = [[0; 4]; 24];
+    let mut to_permute = [0, 1, 2, 3];
+    // "push" initial combo
+    generated[0] = to_permute;
+    let mut gen_idx = 1;
+    let mut c = [0; 4];
+    let mut i = 0;
+    while i < to_permute.len() {
+        if c[i] < i {
+            let idx1 = if i % 2 == 0 { 0 } else { c[i] };
+            let tmp = to_permute[idx1];
+            to_permute[idx1] = to_permute[i];
+            to_permute[i] = tmp;
+            generated[gen_idx] = to_permute;
+            gen_idx += 1;
+            c[i] = c[i] + 1;
+            i = 0;
+        } else {
+            c[i] = 0;
+            i += 1;
+        }
+    }
+    generated
+};
 
 #[derive(Copy, Clone, PartialEq)]
 enum Background {
@@ -36,7 +70,7 @@ impl Board {
         }
     }
 
-    fn empty_with_edge_walls(width: usize, height: usize) -> Self {
+    fn initialize(width: usize, height: usize, ghost_num: usize) -> Self {
         let mut board = Board::new(width, height);
         for x in 0..width {
             board.tiles[0][x] = Background::Wall;
@@ -46,7 +80,24 @@ impl Board {
             board.tiles[y][0] = Background::Wall;
             board.tiles[y][width - 1] = Background::Wall;
         }
+        while board.ghosts.len() < ghost_num {
+            let pos = board.rand_empty_pos();
+            board.ghosts.push(pos);
+        }
+        board.pacman = board.rand_empty_pos();
         board
+    }
+
+    fn rand_empty_pos(&mut self) -> (usize, usize) {
+        let height = self.tiles.len();
+        let width = self.tiles[0].len();
+        loop {
+            let x = self.rng.gen_range(0..width);
+            let y = self.rng.gen_range(0..height);
+            if self.tiles[y][x] == Background::Empty && !self.ghosts.contains(&(x, y)) {
+                return (x, y);
+            }
+        }
     }
 
     fn render(&self) {
@@ -98,36 +149,7 @@ impl Board {
     }
 }
 
-const DIR_PERMUTATIONS: [[usize; 4]; 24] = perms();
-
-// Non-recursive heaps algorithm
-const fn perms() -> [[usize; 4]; 24] {
-    let mut generated: [[usize; 4]; 24] = [[0; 4]; 24];
-    let mut to_permute = [0, 1, 2, 3];
-    // "push" initial combo
-    generated[0] = to_permute;
-    let mut gen_idx = 1;
-    let mut c = [0; 4];
-    let mut i = 0;
-    while i < to_permute.len() {
-        if c[i] < i {
-            let idx1 = if i % 2 == 0 { 0 } else { c[i] };
-            let tmp = to_permute[idx1];
-            to_permute[idx1] = to_permute[i];
-            to_permute[i] = tmp;
-            generated[gen_idx] = to_permute;
-            gen_idx += 1;
-            c[i] = c[i] + 1;
-            i = 0;
-        } else {
-            c[i] = 0;
-            i += 1;
-        }
-    }
-    generated
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 enum Action {
     Idle,
     Up,
@@ -153,14 +175,14 @@ impl Action {
 
 type StateActions = [(Action, f64); 5];
 
-#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 enum Tile {
     Empty,
     Ghost,
     Wall,
 }
 
-#[derive(Hash, PartialEq, Eq, Clone)]
+#[derive(Hash, PartialEq, Eq, Clone, Serialize, Deserialize)]
 struct QState {
     // 5*5 - 1 view surrounding pacman
     surroundings: [Tile; 24],
@@ -173,8 +195,6 @@ struct PaQman {
     /// Between [0.0, 1.0]
     discount_rate: f64,
 }
-
-const DEFAULT_QUALITY: f64 = 0.0;
 
 impl PaQman {
     fn new() -> Self {
@@ -271,8 +291,7 @@ impl PaQman {
             }
         }
         // TODO: Try to figure out how to convert gx & gy into surroundings indices
-        for (gx, gy) in board.ghosts.iter() {
-        }
+        for (gx, gy) in board.ghosts.iter() {}
         QState { surroundings }
     }
 }
@@ -295,16 +314,30 @@ impl PacmanAi for PaQman {
     }
 }
 
-fn main() {
+#[derive(Parser, Debug)]
+struct Opts {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    Train {
+        #[arg(short, long, default_value = "100000")]
+        iterations: usize,
+        #[arg(short, long)]
+        q_path: String,
+    },
+    Run {
+        #[arg(short, long)]
+        q_path: String,
+    },
+}
+
+fn run_train(iterations: usize, q_path: String) {
     let mut ai = PaQman::new();
-    let iter_count = 1_000_000;
-    for iter in 0..iter_count {
-        let mut board = Board::empty_with_edge_walls(10, 10);
-        for x in 1..5 {
-            board.ghosts.push((x, 1));
-            board.ghosts.push((x, 2));
-            board.ghosts.push((x, 3));
-        }
+    for iter in 0..iterations {
+        let mut board = Board::initialize(10, 10, 7);
         while !board.is_game_over() {
             ai.tick_pacman(&mut board);
             if board.is_game_over() {
@@ -317,17 +350,22 @@ fn main() {
             stdout().flush().expect("I couldn't flush the toilet :(");
         }
         let min_epsilon = 0.05f64;
-        let r = -min_epsilon.ln() / iter_count as f64;
+        let r = -min_epsilon.ln() / iterations as f64;
         ai.discount_rate = (-r * iter as f64).exp();
     }
+    let contents = to_allocvec(&ai.q_table).unwrap();
+    let mut file = File::create(q_path).unwrap();
+    file.write_all(&contents).unwrap();
+}
+
+fn run_game(q_path: String) {
+    let mut ai = PaQman::new();
+
+    let bytes = fs::read(q_path).unwrap();
+    ai.q_table = from_bytes(&bytes).unwrap();
     ai.discount_rate = 0.0;
 
-    let mut board = Board::empty_with_edge_walls(10, 10);
-    for x in 1..5 {
-        board.ghosts.push((x, 1));
-        board.ghosts.push((x, 2));
-        board.ghosts.push((x, 3));
-    }
+    let mut board = Board::initialize(10, 10, 7);
     loop {
         board.render();
         sleep(Duration::from_millis(100));
@@ -341,5 +379,16 @@ fn main() {
             println!("Game over... LOSER");
             break;
         }
+    }
+}
+
+fn main() {
+    match Opts::parse().command {
+        Command::Train { iterations, q_path } => {
+            run_train(iterations, q_path);
+        },
+        Command::Run { q_path } => {
+            run_game(q_path);
+        },
     }
 }
