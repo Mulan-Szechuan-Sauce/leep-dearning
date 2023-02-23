@@ -4,7 +4,7 @@ use rand::{prelude::SliceRandom, rngs::SmallRng, Rng, SeedableRng};
 use serde::{Serialize, Deserialize};
 use std::{
     collections::HashMap,
-    io::{stdout, Write, Read},
+    io::{stdout, Write},
     thread::sleep,
     time::Duration, fs::{File, self},
 };
@@ -42,6 +42,7 @@ const DIR_PERMUTATIONS: [[usize; 4]; 24] = {
 enum Background {
     Empty,
     Wall,
+    Food,
 }
 
 fn clear_screen() {
@@ -63,7 +64,7 @@ trait PacmanAi {
 impl Board {
     fn new(width: usize, height: usize) -> Self {
         Board {
-            tiles: vec![vec![Background::Empty; width]; height],
+            tiles: vec![vec![Background::Food; width]; height],
             ghosts: vec![],
             pacman: (5, 5),
             rng: SmallRng::from_entropy(),
@@ -94,7 +95,7 @@ impl Board {
         loop {
             let x = self.rng.gen_range(0..width);
             let y = self.rng.gen_range(0..height);
-            if self.tiles[y][x] == Background::Empty && !self.ghosts.contains(&(x, y)) {
+            if self.tiles[y][x] != Background::Wall && !self.ghosts.contains(&(x, y)) {
                 return (x, y);
             }
         }
@@ -106,17 +107,16 @@ impl Board {
             for x in 0..self.tiles[0].len() {
                 print!(
                     "{}",
-                    match self.tiles[y][x] {
-                        Background::Empty => {
-                            if self.pacman == (x, y) {
-                                '🤪'
-                            } else if self.ghosts.contains(&(x, y)) {
-                                '👻'
-                            } else {
-                                '　'
-                            }
+                    if self.pacman == (x, y) {
+                        '🤪'
+                    } else if self.ghosts.contains(&(x, y)) {
+                        '👻'
+                    } else {
+                        match self.tiles[y][x] {
+                            Background::Empty => '　',
+                            Background::Wall => '⬜',
+                            Background::Food => 'ｏ',
                         }
-                        Background::Wall => '⬜',
                     }
                 );
             }
@@ -135,7 +135,7 @@ impl Board {
             let order = DIR_PERMUTATIONS.choose(&mut self.rng).unwrap();
             for q in order.iter() {
                 let (xi, yi) = moves[*q];
-                if matches!(self.tiles[yi][xi], Background::Empty) && !self.has_ghost_at(xi, yi) {
+                if !matches!(self.tiles[yi][xi], Background::Wall) && !self.has_ghost_at(xi, yi) {
                     self.ghosts[i] = (xi, yi);
                     break;
                 }
@@ -147,9 +147,20 @@ impl Board {
         let (x, y) = self.pacman;
         self.tiles[y][x] == Background::Wall || self.ghosts.contains(&self.pacman)
     }
+
+    // Returns true if this action ate some food
+    fn move_pacman(&mut self, x: usize, y: usize) -> bool {
+        if self.tiles[y][x] == Background::Food {
+            self.tiles[y][x] = Background::Empty;
+            self.pacman = (x, y);
+            true
+        } else {
+            false
+        }
+    }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Debug)]
 enum Action {
     Idle,
     Up,
@@ -159,8 +170,7 @@ enum Action {
 }
 
 impl Action {
-    fn random() -> Action {
-        let mut rng = SmallRng::from_entropy();
+    fn random(rng: &mut SmallRng) -> Action {
         *[
             Action::Idle,
             Action::Up,
@@ -168,32 +178,35 @@ impl Action {
             Action::Left,
             Action::Right,
         ]
-        .choose(&mut rng)
+        .choose(rng)
         .unwrap()
     }
 }
 
 type StateActions = [(Action, f64); 5];
+type QTable = HashMap<QState, StateActions>;
 
-#[derive(Hash, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Debug)]
 enum Tile {
     Empty,
     Ghost,
     Wall,
+    Food,
 }
 
-#[derive(Hash, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Hash, PartialEq, Eq, Clone, Serialize, Deserialize, Debug)]
 struct QState {
     // 5*5 - 1 view surrounding pacman
     surroundings: [Tile; 24],
 }
 
 struct PaQman {
-    q_table: HashMap<QState, StateActions>,
+    q_table: QTable,
     learning_rate: f64,
     /// Changes over time - odds that we'll decide to take a random action
     /// Between [0.0, 1.0]
     discount_rate: f64,
+    rng: SmallRng,
 }
 
 impl PaQman {
@@ -202,13 +215,14 @@ impl PaQman {
             q_table: HashMap::new(),
             learning_rate: 0.7, // Apparently this is a good learning rate
             discount_rate: 0.95,
+            rng: SmallRng::from_entropy(),
         }
     }
 
     /// Bellman's algorithm to update table
     fn update_q_table(&mut self, reward: f64, state: &QState, new_state: &QState, action: Action) {
-        let prev_quality = self.get_quality(state, action);
         let best_next_q = self.get_best_action(new_state).1;
+        let prev_quality = self.get_quality(state, action);
         let new_quality = prev_quality
             + self.learning_rate * (reward + self.discount_rate * best_next_q - prev_quality);
         self.set_quality(state, action, new_quality);
@@ -241,32 +255,29 @@ impl PaQman {
     }
 
     /// Use discount rate to decide between rng and using the qable
-    fn pick_action(&self, q_state: &QState) -> Action {
+    fn pick_action(&mut self, q_state: &QState) -> Action {
         if SmallRng::from_entropy().gen_range(0.0..1.0) < self.discount_rate {
-            Action::random()
+            Action::random(&mut self.rng)
         } else {
             self.get_best_action(q_state).0
         }
     }
 
-    fn get_best_action(&self, q_state: &QState) -> (Action, f64) {
+    fn get_best_action(&mut self, q_state: &QState) -> (Action, f64) {
         match self.q_table.get(q_state) {
             Some(actions) => *actions
                 .iter()
                 .max_by(|(_, q1), (_, q2)| q1.total_cmp(q2))
                 .unwrap(),
-            None => (Action::random(), DEFAULT_QUALITY),
+            None => (Action::random(&mut self.rng), DEFAULT_QUALITY),
         }
     }
 
     fn tile_at_coord(board: &Board, coord: (usize, usize)) -> Tile {
-        if board.ghosts.contains(&coord) {
-            Tile::Ghost
-        } else {
-            match board.tiles[coord.1][coord.0] {
-                Background::Empty => Tile::Empty,
-                Background::Wall => Tile::Wall,
-            }
+        match board.tiles[coord.1][coord.0] {
+            Background::Empty => Tile::Empty,
+            Background::Wall => Tile::Wall,
+            Background::Food => Tile::Food,
         }
     }
 
@@ -290,8 +301,22 @@ impl PaQman {
                 i += 1;
             }
         }
-        // TODO: Try to figure out how to convert gx & gy into surroundings indices
-        for (gx, gy) in board.ghosts.iter() {}
+        // Yaaay hardcoding!
+        for (gx, gy) in board.ghosts.iter() {
+            if gx.abs_diff(board.pacman.0) > 2 {
+                continue;
+            }
+            if gy.abs_diff(board.pacman.1) > 2 {
+                continue;
+            }
+            let rx = 2 + gx - board.pacman.0;
+            let ry = 2 + gy - board.pacman.1;
+            let mut idx = rx + ry * 5;
+            if idx > 12 {
+                idx -= 1;
+            }
+            surroundings[idx] = Tile::Ghost;
+        }
         QState { surroundings }
     }
 }
@@ -308,8 +333,16 @@ impl PacmanAi for PaQman {
             Action::Left => (x - 1, y),
             Action::Right => (x + 1, y),
         };
-        board.pacman = new_coords;
-        let reward = if board.is_game_over() { -1.0 } else { 0.0 };
+        let ate_food = board.move_pacman(new_coords.0, new_coords.1);
+        let reward = if board.is_game_over() {
+            -1.0
+        } else {
+            if ate_food {
+                1.0
+            } else {
+                0.0
+            }
+        };
         self.update_q_table(reward, &current_state, &PaQman::make_q_state(board), action);
     }
 }
@@ -320,49 +353,67 @@ struct Opts {
     command: Command,
 }
 
+
+#[derive(Parser, Debug)]
+struct TrainCommand {
+    #[arg(short, long, default_value = "100000")]
+    iterations: usize,
+    #[arg(short, long)]
+    out_path: String,
+    #[arg(short, long)]
+    in_path: Option<String>,
+    #[arg(short, long, default_value = "1.0")]
+    initial_gamma: f64,
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
-    Train {
-        #[arg(short, long, default_value = "100000")]
-        iterations: usize,
-        #[arg(short, long)]
-        q_path: String,
-    },
+    Train(TrainCommand),
     Run {
         #[arg(short, long)]
         q_path: String,
     },
 }
 
-fn run_train(iterations: usize, q_path: String) {
+fn load_q_table(path: &str) -> QTable {
+    let bytes = fs::read(path).unwrap();
+    from_bytes(&bytes).unwrap()
+}
+
+fn run_train(args: TrainCommand) {
     let mut ai = PaQman::new();
-    for iter in 0..iterations {
+
+    if let Some(in_path) = args.in_path {
+        ai.q_table = load_q_table(&in_path);
+    }
+    ai.discount_rate = args.initial_gamma;
+    for iter in 0..args.iterations {
         let mut board = Board::initialize(10, 10, 7);
-        while !board.is_game_over() {
+        let mut ticks = 0;
+        while !board.is_game_over() && ticks < 10_000 {
+            ticks += 1;
             ai.tick_pacman(&mut board);
             if board.is_game_over() {
                 break;
             }
             board.tick_ghosts();
         }
-        if iter % 1000 == 0 {
-            print!("Ran iteration {iter}, {}\r", ai.discount_rate);
+        if iter % 10000 == 0 {
+            print!("Ran iteration {iter} ({:.2}%), {}\r", 100. * iter as f64 / args.iterations as f64, ai.discount_rate);
             stdout().flush().expect("I couldn't flush the toilet :(");
         }
         let min_epsilon = 0.05f64;
-        let r = -min_epsilon.ln() / iterations as f64;
-        ai.discount_rate = (-r * iter as f64).exp();
+        let r = -(min_epsilon / args.initial_gamma).ln() / args.iterations as f64;
+        ai.discount_rate = args.initial_gamma * (-r * iter as f64).exp();
     }
     let contents = to_allocvec(&ai.q_table).unwrap();
-    let mut file = File::create(q_path).unwrap();
+    let mut file = File::create(args.out_path).unwrap();
     file.write_all(&contents).unwrap();
 }
 
 fn run_game(q_path: String) {
     let mut ai = PaQman::new();
-
-    let bytes = fs::read(q_path).unwrap();
-    ai.q_table = from_bytes(&bytes).unwrap();
+    ai.q_table = load_q_table(&q_path);
     ai.discount_rate = 0.0;
 
     let mut board = Board::initialize(10, 10, 7);
@@ -384,8 +435,8 @@ fn run_game(q_path: String) {
 
 fn main() {
     match Opts::parse().command {
-        Command::Train { iterations, q_path } => {
-            run_train(iterations, q_path);
+        Command::Train(cmd) => {
+            run_train(cmd);
         },
         Command::Run { q_path } => {
             run_game(q_path);
